@@ -5,6 +5,8 @@ keep the torso facing any threat (rear armor is x1.5), dodge incoming shots, and
 """
 import math
 import random
+import json
+import os
 import mechfight as mf
 
 PICK_ORDER = ["armor", "plating", "nanites", "servos", "gun_damage", "gun_rate", "gun_mag", "laser_damage",
@@ -58,6 +60,8 @@ class Bot:
         self.pickup_r = cfg["loot"]["pickup_radius"]
         self.strafe = 1
         self.strafe_until = 0.0
+        self.jiggle_until = 0.0
+        self.jump_until = 0.0
         self.hit_bearing = None
         self.hit_t = -99.0
         self.stuck = 0
@@ -66,6 +70,69 @@ class Bot:
         self.last_cmd = 0.0
         self.scan = 0.0
         self.nlog = 0
+        self.cover_points = self._load_cover_points(hello)
+
+    @staticmethod
+    def _load_cover_points(hello):
+        map_dir = hello.get("map", {}).get("dir")
+        if not map_dir:
+            return []
+        world_path = os.path.join(map_dir, "v2", "world.json")
+        try:
+            with open(world_path, "r", encoding="utf-8") as f:
+                world = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        points = []
+        for prism in world.get("prisms", []):
+            if prism.get("kind") not in ("building", "stadium", "bridge"):
+                continue
+            ring = prism.get("ring", [])
+            if len(ring) < 6:
+                continue
+            cx = sum(ring[0::2]) / (len(ring) // 2)
+            cy = sum(ring[1::2]) / (len(ring) // 2)
+            for i in range(0, len(ring), 2):
+                j = (i + 2) % len(ring)
+                ax, ay = ring[i], ring[i + 1]
+                bx, by = ring[j], ring[j + 1]
+                mx, my = (ax + bx) * 0.5, (ay + by) * 0.5
+                ex, ey = unit(bx - ax, by - ay)
+                nx, ny = -ey, ex
+                if (mx + nx - cx) * nx + (my + ny - cy) * ny < 0:
+                    nx, ny = -nx, -ny
+                points.append((mx + nx * 7.0, my + ny * 7.0))
+        return points
+
+    def _best_cover(self, me, enemy, obs):
+        ex, ey = enemy["pos"][0], enemy["pos"][1]
+        mx, my = me["pos"][0], me["pos"][1]
+        candidates = []
+
+        for c in obs["crates"]:
+            cx, cy = c["pos"][0], c["pos"][1]
+            ux, uy = unit(cx - ex, cy - ey)
+            candidates.append((cx + ux * 5.5, cy + uy * 5.5))
+
+        for px, py in self.cover_points:
+            if math.hypot(px - mx, py - my) < 50:
+                candidates.append((px, py))
+
+        best = None
+        best_score = -1e9
+        for px, py in candidates:
+            db = math.hypot(px - mx, py - my)
+            de = math.hypot(px - ex, py - ey)
+            if db < 5 or db > 55:
+                continue
+            block_angle = abs(wrap(math.atan2(py - my, px - mx)
+                                   - math.atan2(ey - py, ex - px)))
+            score = de * 0.8 - db * 0.12 - block_angle * 2.0
+            if score > best_score:
+                best_score = score
+                best = (px, py)
+        return best
 
     # ---- zone helpers ----
     @staticmethod
@@ -146,7 +213,9 @@ class Bot:
         zn = obs["zone"]
         cc, cr = self.eff_circle(zn, t)
         nc, nr = zn["next_center"], zn["next_radius"]
-        R = max(nr * 0.6, 8.0)
+        # Early matches can hold the central sector, while late matches tighten
+        # around a smaller, protected zone instead of exposing the flanks.
+        R = max(nr * (0.72 if obs["alive"] > 8 else 0.55), 8.0)
         gx, gy = x, y
         dx, dy = x - nc[0], y - nc[1]
         dd = math.hypot(dx, dy)
@@ -163,11 +232,37 @@ class Bot:
             vx += ux
             vy += uy
 
+        # ---- cover-to-cover movement ----
+        cover = None
+        if near:
+            d0, enemy = near[0]
+            if d0 < 75 and (retreat or d0 < 35):
+                cover = self._best_cover(me, enemy, obs)
+            if cover:
+                cx, cy = cover
+                ux, uy = unit(cx - x, cy - y)
+                vx = vx * 0.35 + ux * 1.65
+                vy = vy * 0.35 + uy * 1.65
+                urgent = True
+
         # ---- loot / cubes when quiet ----
         quiet = not near
         calm = not [e for e in near if e[0] < 60]
         want = None
-        if calm and me["weapons"][1] is None:
+        supply = None
+        if calm:
+            viable = [d for d in obs["drops"]
+                      if d["lands_in"] <= 0
+                      and d["holder"] in (None, me["id"])
+                      and math.dist(d["pos"][:2], (x, y)) < 120]
+            if viable and (me["hp"] < me["max_hp"] * 0.85 or me["energy"] < 50):
+                supply = min(viable, key=lambda d: math.dist(d["pos"][:2], (x, y)))
+        if supply:
+            if math.dist(supply["pos"][:2], (x, y)) > supply["radius"] * 0.5:
+                ux, uy = unit(supply["pos"][0] - x, supply["pos"][1] - y)
+                vx, vy = vx * 0.25 + ux * 1.4, vy * 0.25 + uy * 1.4
+                urgent = True
+        elif calm and me["weapons"][1] is None:
             best = -1
             for p in obs["pickups"]:
                 if p["kind"] == "gun":
@@ -197,20 +292,21 @@ class Bot:
         if near:
             if t > self.strafe_until:
                 self.strafe = self.rng.choice((-1, 1))
-                self.strafe_until = t + self.rng.uniform(0.8, 1.8)
+                self.strafe_until = t + self.rng.uniform(0.35, 0.75)
             d0, m0 = near[0]
             ax, ay = unit(x - m0["pos"][0], y - m0["pos"][1])
             if retreat:
                 vx += ax * 1.6
                 vy += ay * 1.6
             elif d0 < 30:
-                vx += ax * 0.5
-                vy += ay * 0.5
+                vx += ax * 0.75
+                vy += ay * 0.75
             elif d0 > 55:
                 vx -= ax * 0.8
                 vy -= ay * 0.8
-            vx += -ay * self.strafe * 0.9
-            vy += ax * self.strafe * 0.9
+            jiggle = 1.25 if d0 < 18 else 0.9
+            vx += -ay * self.strafe * jiggle
+            vy += ax * self.strafe * jiggle
             for d, m in near[1:]:
                 bx, by = unit(x - m["pos"][0], y - m["pos"][1])
                 vx += bx * 0.5
@@ -262,6 +358,10 @@ class Bot:
             self.escape_dir = self.rng.choice((-1, 1))
             self.stuck = 0
         jump = False
+        if near and near[0][0] < 18 and t >= self.jump_until and me["grounded"]:
+            if self.rng.random() < 0.35:
+                jump = True
+                self.jump_until = t + 2.2
         if t < self.escape_until and (vx or vy):
             ang = math.atan2(vy, vx) + self.escape_dir * math.pi / 2
             n = math.hypot(vx, vy)
